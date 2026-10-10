@@ -1,0 +1,115 @@
+# Complex composed scenario: issue an encrypted JSON session claim, carry request
+# context through JWT signing, verify through both Jwt and JwtKeySet, and exercise
+# Result success, error, propagation, and guarded do/catch paths.
+# expect: PASS 1 context drives claims
+# expect: PASS 2 JSON and bytes prepare secret
+# expect: PASS 3 signing Result succeeds
+# expect: PASS 4 compact token shape
+# expect: PASS 5 verifier distinguishes secrets
+# expect: PASS 6 decode Result succeeds
+# expect: PASS 7 decoded context claims
+# expect: PASS 8 encrypted claim decrypts
+# expect: PASS 9 decrypted claim is core JSON
+# expect: PASS 10 key-set model verifies
+# expect: PASS 11 key-set model decodes
+# expect: PASS 12 verification error is typed
+# expect: PASS 13 propagation preserves error
+# expect: PASS 14 crypto rejects wrong context
+# expect: PASS 15 malformed token is rejected
+# expect: PASS 16 rotation removes trust
+# expect: 16 passed, 0 failed, 16 total
+
+from @lam/jwt import Jwt, JwtKeySet
+from lambytes import Bytes
+from lamcontext import Context
+from lamcrypto import Crypto
+from lamerrors import Result, Error
+from lamjson import Json
+from lamtest import Test
+
+func encryptionKey() -> list[int] {
+    return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+}
+
+func issueSession(ctx: Context, keys: JwtKeySet) -> Result[str] {
+    secretHex: str = Bytes.hexEncode("rotation-secret")
+    secret: str = Bytes.hexDecode(secretHex)?
+    metadata: dict[str, any] = {}
+    metadata["request_id"] = ctx.get("request_id")
+    metadata["tenant"] = ctx.get("tenant")
+    metadataValue: json = Json.fromValue(metadata)?
+    metadataJson: str = Json.encode(metadataValue)?
+    envelope: str = Crypto.encrypt(metadataJson, encryptionKey(), "jwt-session")?
+
+    claims: dict[str, any] = {}
+    claims["sub"] = "alice"
+    claims["tenant"] = ctx.get("tenant")
+    claims["request_id"] = ctx.get("request_id")
+    claims["session"] = envelope
+    keys.addHS("active", secret)
+    return Jwt.signHS256(claims, secret, 120)
+}
+
+func propagatedTenant(token: str, secret: str) -> Result[str] {
+    claims: dict[str, any] = Jwt.decodeHS256(token, secret)?
+    return Result.Ok(str(claims["tenant"]))
+}
+
+func main() {
+    ctx: Context = Context.simple()
+    ctx.set("tenant", "acme")
+    ctx.set("request_id", "req-42")
+    Test.assertTrue(ctx.has("tenant") and ctx.get("request_id") == "req-42", "1 context drives claims")
+
+    secretHex: str = Bytes.hexEncode("rotation-secret")
+    secretRes: Result[str] = Bytes.hexDecode(secretHex)
+    Test.assertTrue(secretRes.ok() and secretRes.value == "rotation-secret", "2 JSON and bytes prepare secret")
+
+    keys: JwtKeySet = JwtKeySet()
+    tokenRes: Result[str] = issueSession(ctx, keys)
+    Test.assertTrue(tokenRes.ok(), "3 signing Result succeeds")
+
+    do {
+        token: str = tokenRes?
+        Test.assertTrue(len(token.split(".")) == 3, "4 compact token shape")
+        Test.assertTrue(Jwt.verifyHS256(token, "rotation-secret") and not Jwt.verifyHS256(token, "wrong"), "5 verifier distinguishes secrets")
+
+        decodedRes: Result[dict[str, any]] = Jwt.decodeHS256(token, "rotation-secret")
+        Test.assertTrue(decodedRes.ok(), "6 decode Result succeeds")
+        decoded: dict[str, any] = decodedRes?
+        Test.assertTrue(decoded["tenant"] == "acme" and decoded["request_id"] == "req-42", "7 decoded context claims")
+
+        envelope: str = str(decoded["session"])
+        plainRes: Result[str] = Crypto.decrypt(envelope, encryptionKey(), "jwt-session")
+        Test.assertTrue(plainRes.ok(), "8 encrypted claim decrypts")
+        plain: str = plainRes?
+        parsed: json = Json.decode(plain)?
+        metadata: dict[str, any] = Json.toDict(parsed)?
+        Test.assertTrue(Json.kind(parsed) == "object" and metadata["request_id"] == "req-42", "9 decrypted claim is core JSON")
+
+        Test.assertTrue(keys.size() == 1 and keys.verifyHS256(token), "10 key-set model verifies")
+        viaModel: dict[str, any] = keys.decodeHS256(token)
+        Test.assertTrue(viaModel["sub"] == "alice", "11 key-set model decodes")
+
+        rejected: Result[dict[str, any]] = Jwt.decodeHS256(token, "wrong")
+        rejectedError: Error = rejected.error
+        Test.assertTrue(not rejected.ok() and rejectedError.kind == "JwtVerifyError", "12 verification error is typed")
+
+        propagated: Result[str] = propagatedTenant(token, "wrong")
+        propagatedError: Error = propagated.error
+        Test.assertTrue(not propagated.ok() and propagatedError.kind == "JwtVerifyError", "13 propagation preserves error")
+
+        Test.assertFalse(Crypto.decrypt(envelope, encryptionKey(), "wrong-context").ok(), "14 crypto rejects wrong context")
+
+        malformed: Result[dict[str, any]] = Jwt.decodeHS256("not.a.jwt", "rotation-secret")
+        Test.assertFalse(malformed.ok(), "15 malformed token is rejected")
+
+        keys.remove("active")
+        Test.assertTrue(keys.size() == 0 and not keys.verifyHS256(token), "16 rotation removes trust")
+    } catch outer {
+        print(f"unexpected composed JWT error: {outer}")
+    }
+
+    Test.summary()
+}

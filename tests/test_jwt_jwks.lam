@@ -67,8 +67,12 @@ func main() {
     print(f"verify-kid-b-good: {ks.verifyHS256(tokenB)}")
 
     # Token without any kid header → fallback: try every key.
-    tokenNoKid: str = Jwt.signHS256(claims, "secretA", 60)
-    print(f"verify-without-kid: {ks.verifyHS256(tokenNoKid)}")
+    do {
+        tokenNoKid: str = Jwt.signHS256(claims, "secretA", 60)?
+        print(f"verify-without-kid: {ks.verifyHS256(tokenNoKid)}")
+    } catch err {
+        print(f"unexpected JWT error: {err}")
+    }
 
     # Rotate: remove kid-a. Tokens signed under kid-a should now fail
     # because the remaining key (secretB) cannot verify the signature.
@@ -81,7 +85,7 @@ func main() {
     print(f"kid-extracted: {extracted}")
 
     # ── Malformed JWKS JSON.
-    badResult: Result = ks.loadJwks("{not valid")
+    badResult: Result[int] = ks.loadJwks("{not valid")
     badErr: bool = not badResult.ok()
     print(f"loadjwks-bad: {badErr}")
 
@@ -125,12 +129,12 @@ func main() {
     }
 
     ks2: JwtKeySet = JwtKeySet()
-    loadRes: Result = ks2.loadJwks(jwksDoc)
-    loaded: any = 0
-    if loadRes.ok() {
-        loaded = loadRes.unwrap()
+    do {
+        loaded: int = ks2.loadJwks(jwksDoc)?
+        print(f"rsa-jwks-loaded: {loaded}")
+    } catch err {
+        print(f"unexpected JWKS error: {err}")
     }
-    print(f"rsa-jwks-loaded: {loaded}")
 
     rsaTok: str = Jwt.signRS256Kid(claims, "rsa-kid", privPem, 60)
     print(f"rsa-kid-verify: {ks2.verifyRS256(rsaTok)}")

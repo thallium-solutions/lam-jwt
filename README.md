@@ -12,14 +12,14 @@ underlying JWT and cryptographic operations.
 - RS256 signing, verification, and claim decoding from PEM keys.
 - Automatic `iat` and optional `exp` claims when signing.
 - Configurable verification clock-skew leeway.
-- `Result`-returning variants for error-aware signing and verification.
+- Typed `Result` APIs for error-aware HS256 signing and HS256/RS256 decoding.
 - Thread-safe `JwtKeySet` support for HMAC secrets, RSA public keys, JWKS
   documents, `kid` selection, and key rotation.
 - Explicit unverified payload and `kid` helpers for diagnostics only.
 
 ## Requirements
 
-- `lamc` 1.16.0 or newer within the compatible `1.x` series (`^1.16`).
+- `lamc` 1.18.0 or newer within the compatible `1.x` series (`^1.18`).
 - A Go toolchain available to `lamc` for the pinned
   `github.com/golang-jwt/jwt/v5 v5.3.1` dependency.
 
@@ -40,7 +40,7 @@ lamc install /path/to/lam-jwt
 Install the published registry release:
 
 ```bash
-lamc install @lam/jwt@1.0.0
+lamc install @lam/jwt@2.0.0
 ```
 
 All installation forms use the package name declared in `lamlib.toml`, so the
@@ -54,19 +54,20 @@ from @lam/jwt import Jwt, JwtKeySet
 
 ```lammergeier
 from @lam/jwt import Jwt
+from lamerrors import Result
 
 func main() {
     claims: dict[str, any] = {}
     claims["sub"] = "alice"
     claims["role"] = "admin"
 
-    token: str = Jwt.signHS256(claims, "replace-with-a-strong-secret", 3600)
-    if not Jwt.verifyHS256(token, "replace-with-a-strong-secret") {
-        panic("invalid token")
+    do {
+        token: str = Jwt.signHS256(claims, "replace-with-a-strong-secret", 3600)?
+        payload: dict[str, any] = Jwt.decodeHS256(token, "replace-with-a-strong-secret")?
+        print(payload["sub"])
+    } catch err {
+        print(f"JWT operation failed: {err}")
     }
-
-    payload: dict[str, any] = Jwt.decodeHS256(token, "replace-with-a-strong-secret")
-    print(payload["sub"])
 }
 ```
 
@@ -81,15 +82,17 @@ keys.
 
 ## Result-aware verification
 
-The `try*` methods retain error details instead of returning an empty value or
-`false`. They work with Lammergeier's `?` and `do/catch` flow:
+The unsuffixed `signHS256` and `decode*` methods retain error details instead of
+returning an ambiguous empty value. They work with Lammergeier's `?` and
+`do/catch` flow:
 
 ```lammergeier
 from @lam/jwt import Jwt
+from lamerrors import Result
 
 func verifyRequest(token: str, secret: str) {
     do {
-        payload: dict[str, any] = Jwt.tryDecodeHS256(token, secret)?
+        payload: dict[str, any] = Jwt.decodeHS256(token, secret)?
         print(payload["sub"])
     } catch err {
         print(f"JWT verification failed: {err}")
@@ -97,10 +100,10 @@ func verifyRequest(token: str, secret: str) {
 }
 ```
 
-`Jwt.trySignHS256` returns a `Result` for signing. `Jwt.tryDecodeHS256` and
-`Jwt.tryDecodeRS256` return `JwtVerifyError` failures when parsing, algorithm,
-signature, or claim validation fails. `JwtKeySet.tryDecodeRS256` provides the
-same error-aware behavior for an RSA key set.
+`Jwt.signHS256` returns `Result[str]`. `Jwt.decodeHS256` and `Jwt.decodeRS256`
+return `Result[dict[str, any]]`, with `JwtVerifyError` failures when parsing,
+algorithm, signature, or claim validation fails. `JwtKeySet.decodeRS256`
+provides the same error-aware behavior for an RSA key set.
 
 ## JWKS and key rotation
 
@@ -114,7 +117,7 @@ from lamerrors import Result
 
 func verifyOidcToken(token: str, jwksJson: str) -> bool {
     keys: JwtKeySet = JwtKeySet()
-    loaded: Result = keys.loadJwks(jwksJson)
+    loaded: Result[int] = keys.loadJwks(jwksJson)
     if not loaded.ok() {
         return false
     }
@@ -156,7 +159,7 @@ boolean.
   claim verification and is only suitable for diagnostics or routing.
 - `Jwt.extractKid` is also unverified. Treat the result only as a key-selection
   hint; verification must still succeed.
-- Prefer `decode*` or `tryDecode*` when handling untrusted tokens.
+- Prefer the verified `decode*` methods when handling untrusted tokens.
 - Use strong HMAC secrets, protect private keys, keep token lifetimes short, and
   remove retired keys only after the intended rotation window.
 
@@ -167,7 +170,7 @@ python3 tests/run_lamjwt_tests.py --verbose
 lamc fmt .
 ```
 
-The test runner requires `lamc >= 1.16.0`, stages this checkout as
+The test runner requires `lamc >= 1.18.0`, stages this checkout as
 `extlibs/@lam/jwt` in an isolated temporary tree, compiles both migrated JWT test
 programs without compiler caches, and checks their exact output.
 

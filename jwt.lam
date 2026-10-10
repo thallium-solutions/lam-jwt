@@ -1,4 +1,4 @@
-# @lam/jwt — 1.0.0
+# @lam/jwt — 2.0.0
 #
 # JSON Web Tokens for the Lammergeier programming language, built on
 # ``github.com/golang-jwt/jwt/v5`` (the maintained successor of
@@ -10,14 +10,15 @@
 # Usage::
 #
 #     from @lam/jwt import Jwt
+#     from lamerrors import Result
 #
 #     claims: dict[str, any] = {}
 #     claims["sub"] = "alice"
 #     claims["role"] = "admin"
 #
-#     token: str = Jwt.signHS256(claims, "supersecret", 3600)
+#     token: str = Jwt.signHS256(claims, "supersecret", 3600)?
 #     ok: bool = Jwt.verifyHS256(token, "supersecret")
-#     payload: dict[str, any] = Jwt.decodeHS256(token, "supersecret")
+#     payload: dict[str, any] = Jwt.decodeHS256(token, "supersecret")?
 #     print(payload["sub"])
 #
 # Tokens issued by these helpers always carry ``iat`` (issued-at) and
@@ -309,17 +310,7 @@ class Jwt {
     }
 
     # ── HMAC-SHA256 (HS256) ──────────────────────────────────────
-    static func signHS256(claims: dict[str, any], secret: str, ttlSeconds: int = 3600) -> str {
-        out: str = ""
-        go! {
-            if t, err := lamJwtSignSymmetric(jwt.SigningMethodHS256, claims, secret, ttlSeconds); err == nil {
-                out = t
-            }
-        }
-        return out
-    }
-
-    static func trySignHS256(claims: dict[str, any], secret: str, ttlSeconds: int = 3600) -> Result {
+    static func signHS256(claims: dict[str, any], secret: str, ttlSeconds: int = 3600) -> Result[str] {
         go! {
             t, err := lamJwtSignSymmetric(jwt.SigningMethodHS256, claims, secret, ttlSeconds)
             if err != nil {
@@ -339,17 +330,7 @@ class Jwt {
         return ok
     }
 
-    static func decodeHS256(token: str, secret: str) -> dict[str, any] {
-        out: dict[str, any] = {}
-        go! {
-            if claims, err := lamJwtVerifySymmetric(jwt.SigningMethodHS256, token, secret); err == nil {
-                out = lamJwtClaimsToInterface(claims)
-            }
-        }
-        return out
-    }
-
-    static func tryDecodeHS256(token: str, secret: str) -> Result {
+    static func decodeHS256(token: str, secret: str) -> Result[dict[str, any]] {
         go! {
             claims, err := lamJwtVerifySymmetric(jwt.SigningMethodHS256, token, secret)
             if err != nil {
@@ -411,17 +392,7 @@ class Jwt {
         return ok
     }
 
-    static func decodeRS256(token: str, pubKeyPEM: str) -> dict[str, any] {
-        out: dict[str, any] = {}
-        go! {
-            if claims, err := lamJwtVerifyRSA(token, pubKeyPEM); err == nil {
-                out = lamJwtClaimsToInterface(claims)
-            }
-        }
-        return out
-    }
-
-    static func tryDecodeRS256(token: str, pubKeyPEM: str) -> Result {
+    static func decodeRS256(token: str, pubKeyPEM: str) -> Result[dict[str, any]] {
         go! {
             claims, err := lamJwtVerifyRSA(token, pubKeyPEM)
             if err != nil {
@@ -510,8 +481,10 @@ class JwtKeySet {
            # key at verify time. Tokens without a ``kid`` header are
            # still accepted — the set tries every registered key.
 
-           if !ks.verifyRS256(token) {
-               panic("bad token")
+           do {
+               claims: dict[str, any] = ks.decodeRS256(token)?
+           } catch err {
+               print(f"JWT verification failed: {err}")
            }
 
        Load an entire JWKS document at once via ``loadJwks(json)``;
@@ -519,14 +492,14 @@ class JwtKeySet {
        keys can be removed after the rotation window via
        ``remove(kid)``. -#
 
-    func __init__(self) {
+    func init(self) {
         self._st: any = None
         go! {
             s._st = newLamJwtKeySetState()
         }
     }
 
-    func addRSA(self, kid: str, pubKeyPEM: str) -> Result {
+    func addRSA(self, kid: str, pubKeyPEM: str) -> Result[str] {
         #- Register an RSA public key (PEM-encoded) under ``kid``. -#
         go! {
             pub, err := jwt.ParseRSAPublicKeyFromPEM([]byte(pubKeyPEM))
@@ -552,7 +525,7 @@ class JwtKeySet {
         }
     }
 
-    func addJwk(self, jwk: dict[str, any]) -> Result {
+    func addJwk(self, jwk: dict[str, any]) -> Result[str] {
         #- Register one JWK entry. Currently only ``kty=RSA`` is
            supported; other types return an error. The ``kid`` is
            read from the entry itself. -#
@@ -573,7 +546,7 @@ class JwtKeySet {
         }
     }
 
-    func loadJwks(self, jwksJson: str) -> Result {
+    func loadJwks(self, jwksJson: str) -> Result[int] {
         #- Parse a JWKS document (``{"keys":[{"kty":"RSA",...},...]}``)
            and register every supported entry. Returns ``Ok(n)``
            with the number of keys actually added (non-RSA entries
@@ -659,22 +632,9 @@ class JwtKeySet {
         return ok
     }
 
-    func decodeRS256(self, token: str) -> dict[str, any] {
-        #- Verify ``token`` against every RSA key (kid-first) and
-           return its claims on success; empty dict on failure. -#
-        out: dict[str, any] = {}
-        go! {
-            st, _ := s._st.(*lamJwtKeySetState)
-            if claims, err := lamJwtKeySetVerifyRSA(st, token); err == nil {
-                out = lamJwtClaimsToInterface(claims)
-            }
-        }
-        return out
-    }
-
-    func tryDecodeRS256(self, token: str) -> Result {
-        #- Result-returning variant of ``decodeRS256``; surfaces the
-           underlying verify error for diagnostics. -#
+    func decodeRS256(self, token: str) -> Result[dict[str, any]] {
+        #- Verify ``token`` against every RSA key (kid-first), returning
+           its claims or the underlying verification error. -#
         go! {
             st, _ := s._st.(*lamJwtKeySetState)
             claims, err := lamJwtKeySetVerifyRSA(st, token)
@@ -712,5 +672,5 @@ class JwtKeySet {
 }
 
 func tag() -> str {
-    return "@lam/jwt@1.0.0";
+    return "@lam/jwt@2.0.0";
 }
