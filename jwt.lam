@@ -670,7 +670,3 @@ class JwtKeySet {
         return out
     }
 }
-
-func tag() -> str {
-    return "@lam/jwt@2.0.0";
-}

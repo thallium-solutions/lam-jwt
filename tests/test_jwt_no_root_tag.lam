@@ -1,0 +1,19 @@
+# Regression: the package no longer declares a root ``tag()`` (name and
+# version live in lamlib.toml), so an application or another package may
+# declare its own top-level ``tag`` and still link with this package.
+#
+# expect: tag=application
+# expect: signed=true
+
+from lamerrors import Result
+from @lam/jwt import Jwt
+
+func tag() -> str {
+    return "application"
+}
+
+func main() {
+    print("tag=" + tag())
+    token: Result[str] = Jwt.signHS256({"sub": "user-1"}, "jwt-regression-secret-0123456789", 60)
+    print(f"signed={token.ok()}")
+}
