@@ -1,0 +1,230 @@
+# Test: @lam/jwt ECDSA support (ES256 / ES384 / ES512) and asymmetric key
+# sets.
+#
+# Scenarios:
+#   * ES256/ES384/ES512 sign + verify with PEM keys of the matching curve;
+#     a key of another curve or a different key is rejected; signing with a
+#     key of the wrong curve is an error.
+#   * JwtKeySet.decode verifies RS256, PS256 and ES* tokens against the RSA
+#     and EC keys (kid first), refuses HS256 and "none" tokens and refuses an
+#     RS token re-labelled ES (algorithm confusion).
+#   * JWKS documents with RSA and EC keys load both; "use": "enc" entries
+#     and unknown key types are skipped; an EC point not on its curve and an
+#     unknown curve are rejected by addJwk.
+#   * Expired ES tokens are rejected; rotation (remove kid) works for EC keys.
+#
+# expect: es256-roundtrip: true alice
+# expect: es384-roundtrip: true
+# expect: es512-roundtrip: true
+# expect: es256-other-key: false
+# expect: es256-with-p384-key: false
+# expect: sign-wrong-curve: JwtSignError
+# expect: es-kid-header: ec-1
+# expect: keyset-size: 3
+# expect: keyset-es256: alice
+# expect: keyset-es384-no-kid: bob
+# expect: keyset-rs256: carol
+# expect: keyset-ps256: dave
+# expect: keyset-hs256-refused: true
+# expect: keyset-none-refused: true
+# expect: keyset-confusion-refused: true
+# expect: keyset-expired-refused: true
+# expect: decodeRS256-still-rsa-only: false
+# expect: jwks-loaded: 3
+# expect: jwks-kids: ec-a,ec-b,rsa-a
+# expect: jwks-es256: true
+# expect: jwk-off-curve: JwtKeySetError
+# expect: jwk-bad-curve: JwtKeySetError
+# expect: after-remove: false
+# expect: hs-and-rs-regression: true true
+
+from @lam/jwt import Jwt, JwtKeySet
+from lamerrors import Result
+
+go! {
+    import (
+        "crypto/ecdsa"
+        "crypto/elliptic"
+        "crypto/rand"
+        "crypto/rsa"
+        "crypto/x509"
+        "encoding/base64"
+        "encoding/json"
+        "encoding/pem"
+        "sort"
+        "strings"
+        "time"
+
+        "github.com/golang-jwt/jwt/v5"
+    )
+
+    func ecPair(curve elliptic.Curve) (string, string, *ecdsa.PrivateKey) {
+        key, _ := ecdsa.GenerateKey(curve, rand.Reader)
+        der, _ := x509.MarshalECPrivateKey(key)
+        pub, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+        return string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})),
+            string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub})), key
+    }
+
+    func rsaPair() (string, string, *rsa.PrivateKey) {
+        key, _ := rsa.GenerateKey(rand.Reader, 2048)
+        der := x509.MarshalPKCS1PrivateKey(key)
+        pub, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+        return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})),
+            string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub})), key
+    }
+
+    func ecJwk(kid string, key *ecdsa.PrivateKey, crv string) map[string]interface{} {
+        size := (key.Curve.Params().BitSize + 7) / 8
+        return map[string]interface{}{"kty": "EC", "kid": kid, "crv": crv, "use": "sig",
+            "x": base64.RawURLEncoding.EncodeToString(key.PublicKey.X.FillBytes(make([]byte, size))),
+            "y": base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.FillBytes(make([]byte, size)))}
+    }
+
+    func rsaJwk(kid string, key *rsa.PrivateKey) map[string]interface{} {
+        return map[string]interface{}{"kty": "RSA", "kid": kid, "use": "sig",
+            "n": base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()), "e": "AQAB"}
+    }
+
+    func signWith(method jwt.SigningMethod, key interface{}, kid string, claims jwt.MapClaims) string {
+        tok := jwt.NewWithClaims(method, claims)
+        if kid != "" {
+            tok.Header["kid"] = kid
+        }
+        s, _ := tok.SignedString(key)
+        return s
+    }
+
+    func fresh(sub string) jwt.MapClaims {
+        return jwt.MapClaims{"sub": sub, "exp": time.Now().Add(time.Hour).Unix()}
+    }
+
+    // relabel swaps the header of a signed token (algorithm confusion attempt).
+    func relabel(token, alg string) string {
+        parts := strings.Split(token, ".")
+        header, _ := json.Marshal(map[string]string{"alg": alg, "typ": "JWT"})
+        return base64.RawURLEncoding.EncodeToString(header) + "." + parts[1] + "." + parts[2]
+    }
+
+    func unsigned(sub string) string {
+        header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+        body, _ := json.Marshal(fresh(sub))
+        return header + "." + base64.RawURLEncoding.EncodeToString(body) + "."
+    }
+
+    func sortedKids(kids []string) string {
+        sort.Strings(kids)
+        return strings.Join(kids, ",")
+    }
+}
+
+func errKind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    kind: str = ""
+    err: any = r.error
+    go! {
+        if e, ok := err.(*Error); ok {
+            kind = e.Kind
+        }
+    }
+    return kind
+}
+
+func main() {
+    p256: str = ""
+    p256pub: str = ""
+    p384: str = ""
+    p384pub: str = ""
+    p521: str = ""
+    p521pub: str = ""
+    otherPub: str = ""
+    rsaPriv: str = ""
+    rsaPub: str = ""
+    go! {
+        p256, p256pub, _ = ecPair(elliptic.P256())
+        p384, p384pub, _ = ecPair(elliptic.P384())
+        p521, p521pub, _ = ecPair(elliptic.P521())
+        _, otherPub, _ = ecPair(elliptic.P256())
+        rsaPriv, rsaPub, _ = rsaPair()
+    }
+    claims: dict[str, any] = {"sub": "alice"}
+
+    es256: str = Jwt.signES256(claims, p256, 600).unwrap()
+    decoded: Result[dict[str, any]] = Jwt.decodeES(es256, p256pub)
+    print(f"es256-roundtrip: {decoded.ok()} {decoded.unwrap()['sub']}")
+    print(f"es384-roundtrip: {Jwt.verifyES(Jwt.signES384(claims, p384, 600).unwrap(), p384pub)}")
+    print(f"es512-roundtrip: {Jwt.verifyES(Jwt.signES512(claims, p521, 600).unwrap(), p521pub)}")
+    print(f"es256-other-key: {Jwt.verifyES(es256, otherPub)}")
+    print(f"es256-with-p384-key: {Jwt.verifyES(es256, p384pub)}")
+    print(f"sign-wrong-curve: {errKind(Jwt.signES256(claims, p384, 600))}")
+    withKid: str = Jwt.signES256(claims, p256, 600, "ec-1").unwrap()
+    print(f"es-kid-header: {Jwt.extractKid(withKid)}")
+
+    ks: JwtKeySet = JwtKeySet()
+    _ = ks.addEC("ec-1", p256pub)
+    _ = ks.addEC("ec-2", p384pub)
+    _ = ks.addRSA("rsa-1", rsaPub)
+    print(f"keyset-size: {ks.size()}")
+    print(f"keyset-es256: {ks.decode(withKid).unwrap()['sub']}")
+    bob: dict[str, any] = {"sub": "bob"}
+    print(f"keyset-es384-no-kid: {ks.decode(Jwt.signES384(bob, p384, 600).unwrap()).unwrap()['sub']}")
+    carol: dict[str, any] = {"sub": "carol"}
+    print(f"keyset-rs256: {ks.decode(Jwt.signRS256(carol, rsaPriv, 600)).unwrap()['sub']}")
+    ps256: str = ""
+    hs256: str = ""
+    none: str = ""
+    confused: str = ""
+    expired: str = ""
+    go! {
+        rsaKey, _ := jwt.ParseRSAPrivateKeyFromPEM([]byte(rsaPriv))
+        ps256 = signWith(jwt.SigningMethodPS256, rsaKey, "rsa-1", fresh("dave"))
+        hs256 = signWith(jwt.SigningMethodHS256, []byte("secret"), "ec-1", fresh("mallory"))
+        none = unsigned("mallory")
+        confused = relabel(signWith(jwt.SigningMethodRS256, rsaKey, "", fresh("mallory")), "ES256")
+        ecKey, _ := jwt.ParseECPrivateKeyFromPEM([]byte(p256))
+        expired = signWith(jwt.SigningMethodES256, ecKey, "ec-1", jwt.MapClaims{"sub": "old", "exp": time.Now().Add(-time.Hour).Unix()})
+    }
+    print(f"keyset-ps256: {ks.decode(ps256).unwrap()['sub']}")
+    print(f"keyset-hs256-refused: {not ks.verify(hs256)}")
+    print(f"keyset-none-refused: {not ks.verify(none)}")
+    print(f"keyset-confusion-refused: {not ks.verify(confused)}")
+    print(f"keyset-expired-refused: {not ks.verify(expired)}")
+    print(f"decodeRS256-still-rsa-only: {ks.decodeRS256(withKid).ok()}")
+
+    jwks: str = ""
+    offCurve: dict[str, any] = {}
+    badCurve: dict[str, any] = {}
+    go! {
+        a, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+        b, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+        r, _ := rsa.GenerateKey(rand.Reader, 2048)
+        enc := ecJwk("ec-enc", a, "P-256")
+        enc["use"] = "enc"
+        doc := map[string]interface{}{"keys": []interface{}{ecJwk("ec-a", a, "P-256"), ecJwk("ec-b", b, "P-384"), rsaJwk("rsa-a", r), enc, map[string]interface{}{"kty": "OKP", "kid": "ed", "crv": "Ed25519", "x": "AA"}}}
+        raw, _ := json.Marshal(doc)
+        jwks = string(raw)
+        offCurve = ecJwk("bad", a, "P-256")
+        offCurve["y"] = offCurve["x"]
+        badCurve = ecJwk("bad2", a, "P-256")
+        badCurve["crv"] = "secp256k1"
+        aDer, _ := x509.MarshalECPrivateKey(a)
+        p256 = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: aDer}))
+    }
+    fromJwks: JwtKeySet = JwtKeySet()
+    print(f"jwks-loaded: {fromJwks.loadJwks(jwks).unwrap()}")
+    kids: list[str] = fromJwks.kids()
+    sortedList: str = ""
+    go! { sortedList = sortedKids(kids) }
+    print(f"jwks-kids: {sortedList}")
+    print(f"jwks-es256: {fromJwks.verify(Jwt.signES256(claims, p256, 600, 'ec-a').unwrap())}")
+    print(f"jwk-off-curve: {errKind(fromJwks.addJwk(offCurve))}")
+    print(f"jwk-bad-curve: {errKind(fromJwks.addJwk(badCurve))}")
+    ks.remove("ec-1")
+    print(f"after-remove: {ks.verify(withKid)}")
+
+    hs: str = Jwt.signHS256(claims, "secret", 600).unwrap()
+    rs: str = Jwt.signRS256(claims, rsaPriv, 600)
+    print(f"hs-and-rs-regression: {Jwt.verifyHS256(hs, 'secret')} {Jwt.verifyRS256(rs, rsaPub)}")
+}

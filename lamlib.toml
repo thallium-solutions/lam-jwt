@@ -1,6 +1,6 @@
 [library]
 name = "@lam/jwt"
-version = "3.0.0"
+version = "3.1.0"
 description = "JSON Web Token signing, verification, and JWKS support for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]

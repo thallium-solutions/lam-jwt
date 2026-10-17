@@ -2,6 +2,30 @@
 
 All notable changes to `@lam/jwt` are documented in this file.
 
+## [3.1.0] - 2026-10-21
+
+### Added
+
+- ECDSA: `Jwt.signES256`, `signES384`, `signES512` (PEM private keys,
+  optional `kid`), `Jwt.decodeES` and `verifyES` (PEM public keys). The
+  token's algorithm must match the key's curve (P-256/ES256, P-384/ES384,
+  P-521/ES512).
+- `JwtKeySet.addEC(kid, publicKeyPem)`; `addJwk` and `loadJwks` accept EC
+  entries (`crv`, `x`, `y`; points off the curve are rejected) and skip
+  `use: enc` entries.
+- `JwtKeySet.decode(token)` / `verify(token)`: verify any asymmetric token,
+  RS256/384/512 and PS256/384/512 against the RSA keys or ES256/384/512
+  against the EC keys of the matching curve, `kid` first; HMAC, `none` and
+  algorithm-confusion tokens are refused. Use it for OpenID Connect ID
+  tokens.
+
+### Testing
+
+- `tests/test_jwt_ec.lam`: round trips per curve, wrong keys and curves,
+  key-set selection with and without `kid`, PS256, refused HS256/`none`/
+  confusion/expired tokens, mixed RSA+EC JWKS, invalid EC JWKs, rotation and
+  HS/RS regressions.
+
 ## [3.0.0] - 2026-10-15
 
 ### Removed

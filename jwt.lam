@@ -1,11 +1,13 @@
-# @lam/jwt — 2.0.0
+# @lam/jwt — 3.1.0
 #
 # JSON Web Tokens for the Lammergeier programming language, built on
 # ``github.com/golang-jwt/jwt/v5`` (the maintained successor of
-# ``dgrijalva/jwt-go``). Supports the three algorithms covering 95% of real APIs:
+# ``dgrijalva/jwt-go``). Supports:
 #
-#   * HS256 / HS512 — symmetric, share the secret with the issuer.
-#   * RS256          — asymmetric, RSA public-key verify.
+#   * HS256 / HS512          — symmetric, share the secret with the issuer.
+#   * RS256                  — asymmetric, RSA public-key verify.
+#   * ES256 / ES384 / ES512  — asymmetric, ECDSA (P-256 / P-384 / P-521).
+#   * JwtKeySet.decode       — any RS*, PS*, ES* token against a JWKS.
 #
 # Usage::
 #
@@ -40,12 +42,15 @@ from lamerrors import Result, Error
 
 go! {
     import (
+        "crypto/ecdsa"
+        "crypto/elliptic"
         "crypto/rsa"
         "encoding/base64"
         "encoding/json"
         "errors"
         "fmt"
         "math/big"
+        "strings"
         "sync"
         "sync/atomic"
         "time"
@@ -152,14 +157,160 @@ go! {
     type lamJwtKeySetState struct {
         mu      sync.RWMutex
         rsaKeys map[string]*rsa.PublicKey
+        ecKeys  map[string]*ecdsa.PublicKey
         hsKeys  map[string]string
     }
 
     func newLamJwtKeySetState() *lamJwtKeySetState {
         return &lamJwtKeySetState{
             rsaKeys: map[string]*rsa.PublicKey{},
+            ecKeys:  map[string]*ecdsa.PublicKey{},
             hsKeys:  map[string]string{},
         }
+    }
+
+    // Curves by JWK ``crv`` name and the ES algorithm each one signs.
+    var lamJwtCurves = map[string]elliptic.Curve{"P-256": elliptic.P256(), "P-384": elliptic.P384(), "P-521": elliptic.P521()}
+    var lamJwtCurveAlg = map[string]string{"P-256": "ES256", "P-384": "ES384", "P-521": "ES512"}
+
+    // Decode a JWK EC public key ({kty: EC, crv, x, y}); the point must lie
+    // on the curve.
+    func lamJwtJwkToEC(jwk map[string]interface{}) (*ecdsa.PublicKey, error) {
+        kty, _ := jwk["kty"].(string)
+        if kty != "EC" {
+            return nil, fmt.Errorf("jwk: unsupported kty %q", kty)
+        }
+        crv, _ := jwk["crv"].(string)
+        curve, ok := lamJwtCurves[crv]
+        if !ok {
+            return nil, fmt.Errorf("jwk: unsupported curve %q", crv)
+        }
+        xStr, _ := jwk["x"].(string)
+        yStr, _ := jwk["y"].(string)
+        xBytes, err := base64.RawURLEncoding.DecodeString(xStr)
+        if err != nil || xStr == "" { return nil, errors.New("jwk: bad x") }
+        yBytes, err := base64.RawURLEncoding.DecodeString(yStr)
+        if err != nil || yStr == "" { return nil, errors.New("jwk: bad y") }
+        pub := &ecdsa.PublicKey{Curve: curve, X: new(big.Int).SetBytes(xBytes), Y: new(big.Int).SetBytes(yBytes)}
+        if _, err := pub.ECDH(); err != nil {
+            return nil, errors.New("jwk: point is not on the curve")
+        }
+        return pub, nil
+    }
+
+    func lamJwtCurveName(pub *ecdsa.PublicKey) string {
+        for name, curve := range lamJwtCurves {
+            if pub.Curve == curve {
+                return name
+            }
+        }
+        return ""
+    }
+
+    // lamJwtVerifyEC verifies an ES256/384/512 token whose algorithm matches
+    // the key's curve.
+    func lamJwtVerifyEC(token string, pub *ecdsa.PublicKey) (jwt.MapClaims, error) {
+        want := lamJwtCurveAlg[lamJwtCurveName(pub)]
+        leeway := time.Duration(atomic.LoadInt64(&lamJwtLeewaySec)) * time.Second
+        parsed, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+            if _, ok := t.Method.(*jwt.SigningMethodECDSA); !ok || t.Method.Alg() != want {
+                return nil, fmt.Errorf("unexpected alg: %s", t.Method.Alg())
+            }
+            return pub, nil
+        }, jwt.WithLeeway(leeway))
+        if err != nil { return nil, err }
+        claims, ok := parsed.Claims.(jwt.MapClaims)
+        if !ok || !parsed.Valid {
+            return nil, errors.New("invalid token")
+        }
+        return claims, nil
+    }
+
+    func lamJwtSignEC(alg string, claims map[string]interface{}, privKeyPEM string, kid string, ttl int) (string, error) {
+        priv, err := jwt.ParseECPrivateKeyFromPEM([]byte(privKeyPEM))
+        if err != nil { return "", err }
+        if lamJwtCurveAlg[lamJwtCurveName(&priv.PublicKey)] != alg {
+            return "", fmt.Errorf("%s needs a %s key", alg, map[string]string{"ES256": "P-256", "ES384": "P-384", "ES512": "P-521"}[alg])
+        }
+        tok := jwt.NewWithClaims(jwt.GetSigningMethod(alg), lamJwtBuildClaims(claims, ttl))
+        if kid != "" {
+            tok.Header["kid"] = kid
+        }
+        return tok.SignedString(priv)
+    }
+
+    func lamJwtTokenAlg(token string) string {
+        parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+        t, _, err := parser.ParseUnverified(token, jwt.MapClaims{})
+        if err != nil || t == nil { return "" }
+        return t.Method.Alg()
+    }
+
+    // lamJwtKeySetVerifyAsymmetric verifies an RS*/PS* token against the
+    // RSA keys or an ES* token against the EC keys of the matching curve,
+    // kid first, then every candidate. HMAC and "none" are refused.
+    func lamJwtKeySetVerifyAsymmetric(st *lamJwtKeySetState, token string) (jwt.MapClaims, error) {
+        if st == nil { return nil, errors.New("keyset: nil state") }
+        alg := lamJwtTokenAlg(token)
+        if strings.HasPrefix(alg, "RS") || strings.HasPrefix(alg, "PS") {
+            return lamJwtKeySetVerifyRSAFamily(st, token)
+        }
+        if !strings.HasPrefix(alg, "ES") {
+            return nil, fmt.Errorf("keyset: unsupported alg %q (RSA or EC signatures only)", alg)
+        }
+        st.mu.RLock()
+        defer st.mu.RUnlock()
+        kid := lamJwtTokenKid(token)
+        var lastErr error = errors.New("keyset: no EC key matched token")
+        if k, ok := st.ecKeys[kid]; ok && kid != "" {
+            if claims, err := lamJwtVerifyEC(token, k); err == nil {
+                return claims, nil
+            } else {
+                lastErr = err
+            }
+        }
+        for candidateKid, k := range st.ecKeys {
+            if candidateKid == kid || lamJwtCurveAlg[lamJwtCurveName(k)] != alg { continue }
+            if claims, err := lamJwtVerifyEC(token, k); err == nil {
+                return claims, nil
+            } else {
+                lastErr = err
+            }
+        }
+        return nil, lastErr
+    }
+
+    // RS256/384/512 and PS256/384/512 against the RSA keys.
+    func lamJwtKeySetVerifyRSAFamily(st *lamJwtKeySetState, token string) (jwt.MapClaims, error) {
+        st.mu.RLock()
+        defer st.mu.RUnlock()
+        if len(st.rsaKeys) == 0 {
+            return nil, errors.New("keyset: no RSA keys registered")
+        }
+        leeway := time.Duration(atomic.LoadInt64(&lamJwtLeewaySec)) * time.Second
+        verify := func(key *rsa.PublicKey) (jwt.MapClaims, error) {
+            parsed, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+                switch t.Method.(type) {
+                case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS:
+                    return key, nil
+                }
+                return nil, fmt.Errorf("unexpected alg: %s", t.Method.Alg())
+            }, jwt.WithLeeway(leeway))
+            if err != nil { return nil, err }
+            claims, ok := parsed.Claims.(jwt.MapClaims)
+            if !ok || !parsed.Valid { return nil, errors.New("invalid token") }
+            return claims, nil
+        }
+        kid := lamJwtTokenKid(token)
+        var lastErr error = errors.New("keyset: no RSA key matched token")
+        if k, ok := st.rsaKeys[kid]; ok && kid != "" {
+            if claims, err := verify(k); err == nil { return claims, nil } else { lastErr = err }
+        }
+        for candidateKid, k := range st.rsaKeys {
+            if candidateKid == kid { continue }
+            if claims, err := verify(k); err == nil { return claims, nil } else { lastErr = err }
+        }
+        return nil, lastErr
     }
 
     // Decode a JWK RSA public key ({kty, n, e, kid, …}) into a
@@ -402,6 +553,53 @@ class Jwt {
         }
     }
 
+    # ── ECDSA (ES256 / ES384 / ES512) ─────────────────────────────
+    static func signES256(claims: dict[str, any], privKeyPEM: str, ttlSeconds: int = 3600, kid: str = "") -> Result[str] {
+        #- Sign with an ECDSA P-256 private key (PEM, SEC 1 or PKCS #8). -#
+        return Jwt._signEC("ES256", claims, privKeyPEM, kid, ttlSeconds)
+    }
+
+    static func signES384(claims: dict[str, any], privKeyPEM: str, ttlSeconds: int = 3600, kid: str = "") -> Result[str] {
+        #- Sign with an ECDSA P-384 private key. -#
+        return Jwt._signEC("ES384", claims, privKeyPEM, kid, ttlSeconds)
+    }
+
+    static func signES512(claims: dict[str, any], privKeyPEM: str, ttlSeconds: int = 3600, kid: str = "") -> Result[str] {
+        #- Sign with an ECDSA P-521 private key. -#
+        return Jwt._signEC("ES512", claims, privKeyPEM, kid, ttlSeconds)
+    }
+
+    static func _signEC(alg: str, claims: dict[str, any], privKeyPEM: str, kid: str, ttlSeconds: int) -> Result[str] {
+        go! {
+            signed, err := lamJwtSignEC(alg, claims, privKeyPEM, kid, ttlSeconds)
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtSignError", err.Error(), nil))
+            }
+            return LAMMERGEIER.Result.Ok(signed)
+        }
+    }
+
+    static func decodeES(token: str, pubKeyPEM: str) -> Result[dict[str, any]] {
+        #- Verify an ES256/ES384/ES512 token with an ECDSA public key (PEM);
+           the token's algorithm must match the key's curve. -#
+        go! {
+            pub, err := jwt.ParseECPublicKeyFromPEM([]byte(pubKeyPEM))
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtVerifyError", err.Error(), nil))
+            }
+            claims, err := lamJwtVerifyEC(token, pub)
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtVerifyError", err.Error(), nil))
+            }
+            return LAMMERGEIER.Result.Ok(lamJwtClaimsToInterface(claims))
+        }
+    }
+
+    static func verifyES(token: str, pubKeyPEM: str) -> bool {
+        #- Boolean twin of ``decodeES``. -#
+        return Jwt.decodeES(token, pubKeyPEM).ok()
+    }
+
     # ── Kid-tagged signing (for JWKS-style rotation) ─────────────
     static func signHS256Kid(claims: dict[str, any], kid: str, secret: str, ttlSeconds: int = 3600) -> str {
         #- Like ``signHS256`` but stamps a ``kid`` header on the token
@@ -514,6 +712,25 @@ class JwtKeySet {
         }
     }
 
+    func addEC(self, kid: str, pubKeyPEM: str) -> Result[str] {
+        #- Register an ECDSA public key (PEM, P-256/P-384/P-521) under
+           ``kid``; it verifies ES256/ES384/ES512 tokens of its curve. -#
+        go! {
+            pub, err := jwt.ParseECPublicKeyFromPEM([]byte(pubKeyPEM))
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtKeySetError", err.Error(), nil))
+            }
+            if lamJwtCurveName(pub) == "" {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtKeySetError", "unsupported curve (P-256, P-384 or P-521)", nil))
+            }
+            st := s._st.(*lamJwtKeySetState)
+            st.mu.Lock()
+            st.ecKeys[kid] = pub
+            st.mu.Unlock()
+            return LAMMERGEIER.Result.Ok(kid)
+        }
+    }
+
     func addHS(self, kid: str, secret: str) {
         #- Register an HMAC secret under ``kid``. Used for HS256 /
            HS512 verifies. -#
@@ -526,19 +743,29 @@ class JwtKeySet {
     }
 
     func addJwk(self, jwk: dict[str, any]) -> Result[str] {
-        #- Register one JWK entry. Currently only ``kty=RSA`` is
-           supported; other types return an error. The ``kid`` is
+        #- Register one JWK entry: ``kty=RSA`` or ``kty=EC`` (P-256,
+           P-384, P-521); other types return an error. The ``kid`` is
            read from the entry itself. -#
         go! {
             kid, _ := jwk["kid"].(string)
             if kid == "" {
                 return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtKeySetError", "jwk missing kid", nil))
             }
+            st := s._st.(*lamJwtKeySetState)
+            if kty, _ := jwk["kty"].(string); kty == "EC" {
+                pub, err := lamJwtJwkToEC(jwk)
+                if err != nil {
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtKeySetError", err.Error(), nil))
+                }
+                st.mu.Lock()
+                st.ecKeys[kid] = pub
+                st.mu.Unlock()
+                return LAMMERGEIER.Result.Ok(kid)
+            }
             pub, err := lamJwtJwkToRSA(jwk)
             if err != nil {
                 return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtKeySetError", err.Error(), nil))
             }
-            st := s._st.(*lamJwtKeySetState)
             st.mu.Lock()
             st.rsaKeys[kid] = pub
             st.mu.Unlock()
@@ -548,9 +775,9 @@ class JwtKeySet {
 
     func loadJwks(self, jwksJson: str) -> Result[int] {
         #- Parse a JWKS document (``{"keys":[{"kty":"RSA",...},...]}``)
-           and register every supported entry. Returns ``Ok(n)``
-           with the number of keys actually added (non-RSA entries
-           are silently skipped). Returns ``Err`` if the JSON is
+           and register every RSA and EC signing key (entries with
+           ``use: enc`` and other key types are skipped). Returns
+           ``Ok(n)`` with the number of keys actually added. Returns ``Err`` if the JSON is
            malformed or has no ``keys`` array. -#
         go! {
             var doc map[string]interface{}
@@ -568,13 +795,20 @@ class JwtKeySet {
                 jwk, ok := entry.(map[string]interface{})
                 if !ok { continue }
                 kty, _ := jwk["kty"].(string)
-                if kty != "RSA" { continue } // skip EC / OKP etc.
                 kid, _ := jwk["kid"].(string)
-                if kid == "" { continue }
-                pub, err := lamJwtJwkToRSA(jwk)
-                if err != nil { continue }
-                st.rsaKeys[kid] = pub
-                added++
+                if use, _ := jwk["use"].(string); kid == "" || use == "enc" { continue }
+                switch kty {
+                case "RSA":
+                    pub, err := lamJwtJwkToRSA(jwk)
+                    if err != nil { continue }
+                    st.rsaKeys[kid] = pub
+                    added++
+                case "EC":
+                    pub, err := lamJwtJwkToEC(jwk)
+                    if err != nil { continue }
+                    st.ecKeys[kid] = pub
+                    added++
+                } // other key types (OKP, oct) are skipped
             }
             st.mu.Unlock()
             return LAMMERGEIER.Result.Ok(added)
@@ -589,6 +823,7 @@ class JwtKeySet {
             st := s._st.(*lamJwtKeySetState)
             st.mu.Lock()
             delete(st.rsaKeys, kid)
+            delete(st.ecKeys, kid)
             delete(st.hsKeys, kid)
             st.mu.Unlock()
         }
@@ -600,7 +835,7 @@ class JwtKeySet {
             st := s._st.(*lamJwtKeySetState)
             st.mu.RLock()
             defer st.mu.RUnlock()
-            return len(st.rsaKeys) + len(st.hsKeys)
+            return len(st.rsaKeys) + len(st.ecKeys) + len(st.hsKeys)
         }
     }
 
@@ -611,8 +846,9 @@ class JwtKeySet {
             st := s._st.(*lamJwtKeySetState)
             st.mu.RLock()
             defer st.mu.RUnlock()
-            out := make([]string, 0, len(st.rsaKeys)+len(st.hsKeys))
+            out := make([]string, 0, len(st.rsaKeys)+len(st.ecKeys)+len(st.hsKeys))
             for k := range st.rsaKeys { out = append(out, k) }
+            for k := range st.ecKeys { out = append(out, k) }
             for k := range st.hsKeys { out = append(out, k) }
             return out
         }
@@ -643,6 +879,34 @@ class JwtKeySet {
             }
             return LAMMERGEIER.Result.Ok(lamJwtClaimsToInterface(claims))
         }
+    }
+
+    func decode(self, token: str) -> Result[dict[str, any]] {
+        #- Verify an asymmetrically signed token (RS256/384/512,
+           PS256/384/512 against the RSA keys; ES256/384/512 against the EC
+           keys of the matching curve), ``kid`` first, and return its
+           claims. HMAC and ``none`` tokens are refused: use this for
+           identity-provider tokens (OpenID Connect ID tokens). -#
+        go! {
+            st, _ := s._st.(*lamJwtKeySetState)
+            claims, err := lamJwtKeySetVerifyAsymmetric(st, token)
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error("JwtVerifyError", err.Error(), nil))
+            }
+            return LAMMERGEIER.Result.Ok(lamJwtClaimsToInterface(claims))
+        }
+    }
+
+    func verify(self, token: str) -> bool {
+        #- Boolean twin of ``decode``. -#
+        ok: bool = false
+        go! {
+            st, _ := s._st.(*lamJwtKeySetState)
+            if _, err := lamJwtKeySetVerifyAsymmetric(st, token); err == nil {
+                ok = true
+            }
+        }
+        return ok
     }
 
     func verifyHS256(self, token: str) -> bool {

@@ -10,11 +10,15 @@ underlying JWT and cryptographic operations.
 
 - HS256 and HS512 signing, verification, and claim decoding.
 - RS256 signing, verification, and claim decoding from PEM keys.
+- ES256, ES384 and ES512 (ECDSA P-256, P-384, P-521) signing and
+  verification from PEM keys, with the algorithm bound to the key's curve.
 - Automatic `iat` and optional `exp` claims when signing.
 - Configurable verification clock-skew leeway.
 - Typed `Result` APIs for error-aware HS256 signing and HS256/RS256 decoding.
-- Thread-safe `JwtKeySet` support for HMAC secrets, RSA public keys, JWKS
-  documents, `kid` selection, and key rotation.
+- Thread-safe `JwtKeySet` support for HMAC secrets, RSA and EC public keys,
+  JWKS documents (RSA and EC entries), `kid` selection, and key rotation;
+  `decode` verifies any asymmetric token (RS*, PS*, ES*) such as an OpenID
+  Connect ID token.
 - Explicit unverified payload and `kid` helpers for diagnostics only.
 
 ## Requirements
@@ -40,7 +44,7 @@ lamc install /path/to/lam-jwt
 Install the published registry release:
 
 ```bash
-lamc install @lam/jwt@2.0.0
+lamc install https://github.com/thallium-solutions/lam-jwt.git@3.1.0
 ```
 
 All installation forms use the package name declared in `lamlib.toml`, so the
@@ -121,14 +125,34 @@ func verifyOidcToken(token: str, jwksJson: str) -> bool {
     if not loaded.ok() {
         return false
     }
-    return keys.verifyRS256(token)
+    return keys.verify(token)
 }
 ```
 
-A JWKS document must contain a `keys` array. RSA entries need `kty = "RSA"`, a
-non-empty `kid`, and base64url-encoded modulus (`n`) and exponent (`e`). Other
-key types are skipped. PEM public keys can be added individually with
-`addRSA(kid, publicKeyPem)`.
+`verify`/`decode` accept RS256/384/512 and PS256/384/512 tokens (RSA keys)
+and ES256/ES384/ES512 tokens (EC keys of the matching curve: P-256, P-384,
+P-521). HMAC and `none` tokens are refused, and a token whose header claims
+another algorithm family than its key (algorithm confusion) fails.
+`verifyRS256`/`decodeRS256` keep accepting RSA tokens only.
+
+A JWKS document must contain a `keys` array. Entries need a non-empty `kid`;
+RSA entries (`kty = "RSA"`) need the base64url modulus `n` and exponent `e`, EC
+entries (`kty = "EC"`) the curve `crv` and the coordinates `x` and `y` (points
+off the curve are rejected). Entries marked `use = "enc"` and other key types
+(`OKP`, `oct`) are skipped. PEM public keys can be added individually with
+`addRSA(kid, publicKeyPem)` and `addEC(kid, publicKeyPem)`.
+
+ECDSA tokens:
+
+```lammergeier
+from @lam/jwt import Jwt
+
+func roundTrip(privateKeyPem: str, publicKeyPem: str) -> bool {
+    claims: dict[str, any] = {"sub": "alice"}
+    token: str = Jwt.signES256(claims, privateKeyPem, 300, "key-1").unwrap()
+    return Jwt.verifyES(token, publicKeyPem)
+}
+```
 
 HMAC keys can also rotate by `kid`:
 
