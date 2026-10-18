@@ -1,6 +1,6 @@
 [library]
 name = "@lam/jwt"
-version = "3.1.0"
+version = "3.1.1"
 description = "JSON Web Token signing, verification, and JWKS support for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -8,7 +8,7 @@ repository = "https://github.com/thallium-solutions/lam-jwt"
 homepage = "https://github.com/thallium-solutions/lam-jwt"
 
 [compatibility]
-lamc = "^1.18"
+lamc = ">=1.18, <3"
 
 [go-deps]
 "github.com/golang-jwt/jwt/v5" = "v5.3.1"
