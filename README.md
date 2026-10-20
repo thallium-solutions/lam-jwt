@@ -23,7 +23,7 @@ underlying JWT and cryptographic operations.
 
 ## Requirements
 
-- `lamc` 1.18.0 or newer including the 2.x series (`>=1.18, <3`).
+- `lamc` 1.18.0 or newer including the 2.x series (`>=1.18, <4`).
 - A Go toolchain available to `lamc` for the pinned
   `github.com/golang-jwt/jwt/v5 v5.3.1` dependency.
 
