@@ -2,6 +2,12 @@
 
 All notable changes to `@lam/jwt` are documented in this file.
 
+## [3.1.3] - 2026-11-03
+
+### Changed
+
+- Compatible with `lamc` 4.x: `compatibility.lamc = ">=1.18, <5"` (test runner too).
+
 ## [3.1.2] - 2026-10-20
 
 ### Changed
