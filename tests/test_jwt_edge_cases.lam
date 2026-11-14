@@ -1,0 +1,153 @@
+# Test: @lam/jwt edge cases and error paths not covered elsewhere.
+#
+#   * Claims: `iat` always set by signing (a caller's `iat` is replaced), a
+#     positive TTL adds `exp = iat + ttl`, a TTL of 0 or less omits `exp`;
+#     non-ASCII claims and secrets, nested lists/objects and a 100 000
+#     character claim round-trip.
+#   * Time: expired tokens and future `nbf` are refused; the leeway accepts
+#     a token expired 10 s ago until it is set to 0; a negative leeway is
+#     clamped to 0.
+#   * HS512: decodeHS512 returns the claims, `{}` on a wrong secret; HS256
+#     and HS512 refuse each other's tokens.
+#   * Malformed and tampered tokens: empty, two segments, garbage, a payload
+#     or signature changed by one character; typed `JwtVerifyError`s.
+#   * RS256: bad PEM keys (sign returns "", decode an Err), an HS256 token is
+#     not an RS256 token, the kid of signRS256Kid.
+#   * Diagnostics on garbage: parseUnverified is `{}`, extractKid is "".
+#
+# expect: iat set and replaced: true
+# expect: exp is iat + ttl: true
+# expect: ttl 0 omits exp: true
+# expect: negative ttl omits exp: true
+# expect: unicode claims round-trip: true
+# expect: unicode secret: true wrong-normalisation=false
+# expect: nested claims: [admin ops] 3 true
+# expect: large claim: 100000 true
+# expect: expired refused: JwtVerifyError exp=true
+# expect: future nbf refused: false
+# expect: leeway 30 accepts 10 s late: true
+# expect: leeway 0 refuses it: false
+# expect: negative leeway clamped: 0
+# expect: decodeHS512: bob 0
+# expect: algorithms not interchangeable: false false
+# expect: malformed: empty=JwtVerifyError two-parts=JwtVerifyError garbage=JwtVerifyError
+# expect: tampered payload refused: false
+# expect: tampered signature refused: false
+# expect: rs256 bad keys: sign-empty=true decode=JwtVerifyError verify=false
+# expect: rs256 refuses hs256 token: false
+# expect: rs256 kid: rk-1 verify=true
+# expect: garbage diagnostics: 0 ""
+# expect: ok
+
+from @lam/jwt import Jwt
+from lamerrors import Result
+from lamtime import Time
+
+go! {
+    import (
+        "crypto/rand"
+        "crypto/rsa"
+        "crypto/x509"
+        "encoding/pem"
+    )
+
+    func edgeRsaPair() (string, string) {
+        key, _ := rsa.GenerateKey(rand.Reader, 2048)
+        der := x509.MarshalPKCS1PrivateKey(key)
+        pub, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+        return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})),
+            string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub}))
+    }
+}
+
+const Secret: str = "edge-case-secret-0123456789abcdef"
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func claimInt(claims: dict[str, any], name: str) -> int {
+    return int(float(claims[name]))
+}
+
+func swapChar(text: str, at: int) -> str {
+    #- ``text`` with the character at ``at`` replaced by another one. -#
+    replacement: str = "A" if text[at] != "A" else "B"
+    return text[:at] + replacement + text[at + 1:]
+}
+
+func main() {
+    # ── Claims ───────────────────────────────────────────────────
+    now: int = Time.nowUnix()
+    stamped: dict[str, any] = Jwt.decodeHS256(Jwt.signHS256({"sub": "a", "iat": 5}, Secret, 120).unwrap(), Secret).unwrap()
+    iat: int = claimInt(stamped, "iat")
+    print(f"iat set and replaced: {iat >= now - 5 and iat <= now + 5}")
+    print(f"exp is iat + ttl: {claimInt(stamped, 'exp') == iat + 120}")
+    noExp: dict[str, any] = Jwt.decodeHS256(Jwt.signHS256({"sub": "a"}, Secret, 0).unwrap(), Secret).unwrap()
+    print(f"ttl 0 omits exp: {'exp' not in noExp and 'iat' in noExp}")
+    negative: dict[str, any] = Jwt.decodeHS256(Jwt.signHS256({"sub": "a"}, Secret, -60).unwrap(), Secret).unwrap()
+    print(f"negative ttl omits exp: {'exp' not in negative}")
+
+    unicode: dict[str, any] = {"name": "Ålice Ünïcødé 🦅", "城市": "東京"}
+    back: dict[str, any] = Jwt.decodeHS256(Jwt.signHS256(unicode, Secret).unwrap(), Secret).unwrap()
+    print(f"unicode claims round-trip: {back['name'] == 'Ålice Ünïcødé 🦅' and back['城市'] == '東京'}")
+    # "é" precomposed vs "e" + combining acute: different bytes, different key.
+    signedUnicode: str = Jwt.signHS256({"sub": "a"}, "clé-🔑-secret", 60).unwrap()
+    decomposed: str = "clé-🔑-secret"
+    print(f"unicode secret: {Jwt.verifyHS256(signedUnicode, 'clé-🔑-secret')} wrong-normalisation={Jwt.verifyHS256(signedUnicode, decomposed)}")
+
+    nested: dict[str, any] = {"roles": ["admin", "ops"], "meta": {"level": 3, "active": true}}
+    nestedBack: dict[str, any] = Jwt.decodeHS256(Jwt.signHS256(nested, Secret).unwrap(), Secret).unwrap()
+    meta: dict[str, any] = nestedBack["meta"]
+    print(f"nested claims: {nestedBack['roles']} {int(float(meta['level']))} {meta['active']}")
+
+    big: str = "x" * 100000
+    bigBack: dict[str, any] = Jwt.decodeHS256(Jwt.signHS256({"blob": big}, Secret).unwrap(), Secret).unwrap()
+    print(f"large claim: {len(str(bigBack['blob']))} {bigBack['blob'] == big}")
+
+    # ── Time validation ─────────────────────────────────────────
+    expired: Result[dict[str, any]] = Jwt.decodeHS256(Jwt.signHS256({"exp": now - 3600}, Secret, 0).unwrap(), Secret)
+    print(f"expired refused: {kind(expired)} exp={'exp' in expired.error.message}")
+    print(f"future nbf refused: {Jwt.verifyHS256(Jwt.signHS256({'nbf': now + 3600}, Secret, 0).unwrap(), Secret)}")
+    late: str = Jwt.signHS256({"exp": now - 10}, Secret, 0).unwrap()
+    Jwt.setLeeway(30)
+    print(f"leeway 30 accepts 10 s late: {Jwt.verifyHS256(late, Secret)}")
+    Jwt.setLeeway(0)
+    print(f"leeway 0 refuses it: {Jwt.verifyHS256(late, Secret)}")
+    Jwt.setLeeway(-5)
+    print(f"negative leeway clamped: {Jwt.getLeeway()}")
+    Jwt.setLeeway(30)
+
+    # ── HS512 ───────────────────────────────────────────────────
+    hs512: str = Jwt.signHS512({"sub": "bob"}, Secret, 60)
+    wrong: dict[str, any] = Jwt.decodeHS512(hs512, "other")
+    print(f"decodeHS512: {Jwt.decodeHS512(hs512, Secret)['sub']} {len(wrong)}")
+    hs256: str = Jwt.signHS256({"sub": "bob"}, Secret, 60).unwrap()
+    print(f"algorithms not interchangeable: {Jwt.verifyHS256(hs512, Secret)} {Jwt.verifyHS512(hs256, Secret)}")
+
+    # ── Malformed / tampered ────────────────────────────────────
+    print(f"malformed: empty={kind(Jwt.decodeHS256('', Secret))} two-parts={kind(Jwt.decodeHS256('abc.def', Secret))} garbage={kind(Jwt.decodeHS256('not.a.token', Secret))}")
+    parts: list[str] = hs256.split(".")
+    tamperedPayload: str = ".".join([parts[0], swapChar(parts[1], 3), parts[2]])
+    print(f"tampered payload refused: {Jwt.verifyHS256(tamperedPayload, Secret)}")
+    tamperedSignature: str = ".".join([parts[0], parts[1], swapChar(parts[2], 0)])
+    print(f"tampered signature refused: {Jwt.verifyHS256(tamperedSignature, Secret)}")
+
+    # ── RS256 ───────────────────────────────────────────────────
+    priv: str = ""
+    pub: str = ""
+    go! {
+        priv, pub = edgeRsaPair()
+    }
+    print(f"rs256 bad keys: sign-empty={Jwt.signRS256({'sub': 'a'}, 'not a pem', 60) == ''} decode={kind(Jwt.decodeRS256(Jwt.signRS256({'sub': 'a'}, priv, 60), 'not a pem'))} verify={Jwt.verifyRS256(Jwt.signRS256({'sub': 'a'}, priv, 60), priv + 'x')}")
+    print(f"rs256 refuses hs256 token: {Jwt.verifyRS256(hs256, pub)}")
+    withKid: str = Jwt.signRS256Kid({"sub": "a"}, "rk-1", priv, 60)
+    print(f"rs256 kid: {Jwt.extractKid(withKid)} verify={Jwt.verifyRS256(withKid, pub)}")
+
+    # ── Diagnostics ─────────────────────────────────────────────
+    print(f"garbage diagnostics: {len(Jwt.parseUnverified('garbage'))} \"{Jwt.extractKid('garbage')}\"")
+    print("ok")
+}

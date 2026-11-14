@@ -44,7 +44,7 @@ lamc install /path/to/lam-jwt
 Install the published registry release:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-jwt.git@3.1.0
+lamc install https://github.com/thallium-solutions/lam-jwt.git@3.1.4
 ```
 
 All installation forms use the package name declared in `lamlib.toml`, so the
@@ -184,7 +184,8 @@ boolean.
 - `Jwt.extractKid` is also unverified. Treat the result only as a key-selection
   hint; verification must still succeed.
 - Prefer the verified `decode*` methods when handling untrusted tokens.
-- Use strong HMAC secrets, protect private keys, keep token lifetimes short, and
+- Use strong HMAC secrets (an empty secret is refused: signing fails and no
+  token verifies with it), protect private keys, keep token lifetimes short, and
   remove retired keys only after the intended rotation window.
 
 ## Testing and formatting
@@ -195,8 +196,8 @@ lamc fmt .
 ```
 
 The test runner requires `lamc >= 1.18.0`, stages this checkout as
-`extlibs/@lam/jwt` in an isolated temporary tree, compiles both migrated JWT test
-programs without compiler caches, and checks their exact output.
+`extlibs/@lam/jwt` in an isolated temporary tree, compiles every `tests/test_*.lam`
+program without compiler caches, and checks its exact output.
 
 ## License
 

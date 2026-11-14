@@ -75,12 +75,19 @@ go! {
         return out
     }
 
+    // An empty HMAC secret is refused on both sides: golang-jwt accepts it,
+    // so a missing secret (an unset environment variable) would otherwise
+    // let anyone forge tokens with the empty key.
+    var lamJwtEmptySecret = errors.New("empty HMAC secret")
+
     func lamJwtSignSymmetric(method jwt.SigningMethod, claims map[string]interface{}, secret string, ttl int) (string, error) {
+        if secret == "" { return "", lamJwtEmptySecret }
         tok := jwt.NewWithClaims(method, lamJwtBuildClaims(claims, ttl))
         return tok.SignedString([]byte(secret))
     }
 
     func lamJwtVerifySymmetric(method jwt.SigningMethod, token string, secret string) (jwt.MapClaims, error) {
+        if secret == "" { return nil, lamJwtEmptySecret }
         leeway := time.Duration(atomic.LoadInt64(&lamJwtLeewaySec)) * time.Second
         parsed, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
             if t.Method.Alg() != method.Alg() {
@@ -360,6 +367,9 @@ go! {
                 if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
                     return nil, fmt.Errorf("unexpected alg: %s", t.Method.Alg())
                 }
+                if secret, ok := key.([]byte); ok && len(secret) == 0 {
+                    return nil, lamJwtEmptySecret
+                }
             }
             return key, nil
         }, jwt.WithLeeway(leeway))
@@ -609,7 +619,9 @@ class Jwt {
         go! {
             tok := jwt.NewWithClaims(jwt.SigningMethodHS256, lamJwtBuildClaims(claims, ttlSeconds))
             tok.Header["kid"] = kid
-            if s, err := tok.SignedString([]byte(secret)); err == nil {
+            if secret == "" {
+                // lamJwtEmptySecret: refused, like signHS256.
+            } else if s, err := tok.SignedString([]byte(secret)); err == nil {
                 out = s
             }
         }

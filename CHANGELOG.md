@@ -2,6 +2,32 @@
 
 All notable changes to `@lam/jwt` are documented in this file.
 
+## [3.1.4] - 2026-11-14
+
+### Fixed
+
+- An empty HMAC secret is refused. `golang-jwt` signs and verifies with an
+  empty key, so a service whose secret was missing (an unset environment
+  variable) issued tokens anyone could forge, and accepted them:
+  `signHS256` now returns a `JwtSignError`, `signHS512`/`signHS256Kid` return
+  `""`, `verifyHS256`/`verifyHS512` return `false`, `decodeHS256` a
+  `JwtVerifyError`, `decodeHS512` `{}`, and a `JwtKeySet` never verifies with
+  an empty secret registered by `addHS`.
+
+### Tests
+
+- `tests/test_jwt_edge_cases.lam`: `iat`/`exp` stamping (TTL 0 and negative
+  omit `exp`), non-ASCII claims and secrets, nested and 100 000-character
+  claims, expired and not-yet-valid tokens, leeway (0, clamped negative),
+  `decodeHS512`, HS256/HS512 not interchangeable, empty/malformed/tampered
+  tokens with typed errors, RS256 bad PEM keys and kid, diagnostics on
+  garbage.
+- `tests/test_jwt_keyset_composed.lam`: typed `JwtKeySetError`s of
+  `addRSA`/`addEC`/`addJwk`/`loadJwks`, an empty key set, shared kids across
+  key families, the empty-secret regression, and a rotation stress (a
+  `TokenAuthority` class, 60 async verifications while kids rotate, 20
+  concurrent ES256 decodes, `?` and `do/catch`, comprehensions).
+
 ## [3.1.3] - 2026-11-03
 
 ### Changed

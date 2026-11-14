@@ -1,0 +1,250 @@
+# Test: JwtKeySet error paths, then a cross-feature rotation stress.
+#
+#   * addRSA/addEC/addJwk/loadJwks failures are typed `JwtKeySetError`s
+#     (bad PEM, an RSA key given to addEC, a JWK without kid, without n, with
+#     a zero exponent, of an unsupported kty; JWKS that is not an object or
+#     has no keys array); entries without kid or not objects are skipped.
+#   * An empty key set refuses everything; the RSA and HS maps are separate
+#     (one kid in both counts twice and `remove` drops both); removing an
+#     unknown kid changes nothing; HS key sets verify HS512 tokens too.
+#   * An empty HMAC secret is refused (3.1.4 fix: golang-jwt accepts it, so
+#     a missing secret let anyone forge tokens): signing fails, a token
+#     forged with the empty key verifies neither directly nor through a key
+#     set holding an empty secret.
+#   * Stress: a `TokenAuthority` class rotates HMAC kids while 60 async tasks
+#     verify tokens through the shared key set (Results with `?`, do/catch);
+#     ES256 tokens are verified concurrently through `decode`; once the
+#     oldest kid is removed only its tokens fail (counted with
+#     comprehensions).
+#
+# expect: addRSA bad pem: JwtKeySetError
+# expect: addEC with an RSA key: JwtKeySetError
+# expect: addJwk: no-kid=JwtKeySetError no-n=JwtKeySetError zero-e=JwtKeySetError oct=JwtKeySetError
+# expect: loadJwks: array=JwtKeySetError no-keys=JwtKeySetError empty=0 skipped=0
+# expect: empty set: rs=false no RSA keys=true hs=false hs-claims=0 decode=false
+# expect: shared kid: size=2 after-remove=0
+# expect: unknown remove: 1
+# expect: hs set accepts hs512: true
+# expect: empty secret refused: JwtSignError kid-sign-empty=true hs512-empty=true
+# expect: forged with the empty key: direct=false decode=JwtVerifyError hs512=false keyset=false
+# expect: concurrent verifications: 60/60
+# expect: concurrent es256 decodes: 20/20 subjects=20
+# expect: after removing k0: valid=45 refused=15 refused-kid=k0
+# expect: do/catch reports: JwtVerifyError for k0
+# expect: kids: k1,k2,k3
+# expect: ok
+
+from @lam/jwt import Jwt, JwtKeySet
+from lamerrors import Result, Error
+
+go! {
+    import (
+        "crypto/ecdsa"
+        "crypto/elliptic"
+        "crypto/rand"
+        "crypto/rsa"
+        "crypto/x509"
+        "encoding/pem"
+        "sort"
+        "strings"
+
+        "github.com/golang-jwt/jwt/v5"
+    )
+
+    func ksPairs() (string, string, string) {
+        r, _ := rsa.GenerateKey(rand.Reader, 2048)
+        rsaPub, _ := x509.MarshalPKIXPublicKey(&r.PublicKey)
+        e, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+        ecDer, _ := x509.MarshalECPrivateKey(e)
+        ecPub, _ := x509.MarshalPKIXPublicKey(&e.PublicKey)
+        return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: rsaPub})),
+            string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecDer})),
+            string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: ecPub}))
+    }
+
+    func ksForgeEmptyKey(method jwt.SigningMethod) string {
+        tok := jwt.NewWithClaims(method, jwt.MapClaims{"sub": "mallory"})
+        signed, _ := tok.SignedString([]byte(""))
+        return signed
+    }
+
+    func ksSorted(kids []string) string {
+        sort.Strings(kids)
+        return strings.Join(kids, ",")
+    }
+}
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+class TokenAuthority {
+    #- Issues HS256 tokens under a rotating kid and verifies them through a
+    shared key set. -#
+    func init(self) {
+        self.keys: JwtKeySet = JwtKeySet()
+        self.generation: int = -1
+        self.secrets: dict[str, str] = {}
+        self.rotate()
+    }
+
+    func currentKid(self) -> str {
+        return f"k{self.generation}"
+    }
+
+    func rotate(self) -> str {
+        self.generation += 1
+        kid: str = self.currentKid()
+        secret: str = f"secret-{kid}-" + "s" * (16 + self.generation)
+        self.secrets[kid] = secret
+        self.keys.addHS(kid, secret)
+        return kid
+    }
+
+    func issue(self, sub: str) -> Result[str] {
+        token: str = Jwt.signHS256Kid({"sub": sub, "gen": self.generation}, self.currentKid(), self.secrets[self.currentKid()], 300)
+        if token == "" {
+            return Result.Err(Error("IssueError", f"could not sign for {sub}"))
+        }
+        return Result.Ok(token)
+    }
+
+    func subject(self, token: str) -> Result[str] {
+        claims: dict[str, any] = self.keys.decodeHS256(token)
+        if len(claims) == 0 {
+            return Result.Err(Error("JwtVerifyError", f"refused token for {Jwt.extractKid(token)}"))
+        }
+        return Result.Ok(str(claims["sub"]))
+    }
+}
+
+async func verifyTask(authority: TokenAuthority, token: str) -> Result[str] {
+    sub: str = authority.subject(token)?
+    return Result.Ok(sub)
+}
+
+async func decodeTask(keys: JwtKeySet, token: str) -> Result[str] {
+    claims: dict[str, any] = keys.decode(token)?
+    return Result.Ok(str(claims["sub"]))
+}
+
+func issueBatch(authority: TokenAuthority, count: int) -> Result[list[str]] {
+    tokens: list[str] = []
+    for i in range(count) {
+        tokens.append(authority.issue(f"user-{authority.generation}-{i}")?)
+    }
+    return Result.Ok(tokens)
+}
+
+func main() {
+    rsaPub: str = ""
+    ecPriv: str = ""
+    ecPub: str = ""
+    go! {
+        rsaPub, ecPriv, ecPub = ksPairs()
+    }
+
+    # ── Error paths ─────────────────────────────────────────────
+    ks: JwtKeySet = JwtKeySet()
+    print(f"addRSA bad pem: {kind(ks.addRSA('r', 'not a pem'))}")
+    print(f"addEC with an RSA key: {kind(ks.addEC('e', rsaPub))}")
+    noKid: Result[str] = ks.addJwk({"kty": "RSA", "n": "AQAB", "e": "AQAB"})
+    noN: Result[str] = ks.addJwk({"kty": "RSA", "kid": "a", "e": "AQAB"})
+    zeroE: Result[str] = ks.addJwk({"kty": "RSA", "kid": "a", "n": "AQAB", "e": "AA"})
+    oct: Result[str] = ks.addJwk({"kty": "oct", "kid": "a", "k": "c2VjcmV0"})
+    print(f"addJwk: no-kid={kind(noKid)} no-n={kind(noN)} zero-e={kind(zeroE)} oct={kind(oct)}")
+    empty: Result[int] = ks.loadJwks("{\"keys\": []}")
+    skipped: Result[int] = ks.loadJwks("{\"keys\": [1, \"x\", {\"kty\": \"RSA\", \"n\": \"AQAB\", \"e\": \"AQAB\"}]}")
+    notObject: Result[int] = ks.loadJwks("[1, 2]")
+    noKeys: Result[int] = ks.loadJwks("{\"nokeys\": 1}")
+    print(f"loadJwks: array={kind(notObject)} no-keys={kind(noKeys)} empty={empty.unwrap()} skipped={skipped.unwrap()}")
+
+    hsToken: str = Jwt.signHS256Kid({"sub": "a"}, "x", "secret-for-x-0123456789", 60)
+    rsRefused: Result[dict[str, any]] = ks.decodeRS256(hsToken)
+    print(f"empty set: rs={rsRefused.ok()} no RSA keys={'no RSA keys' in rsRefused.error.message} hs={ks.verifyHS256(hsToken)} hs-claims={len(ks.decodeHS256(hsToken))} decode={ks.decode('garbage').ok()}")
+
+    _ = ks.addRSA("shared", rsaPub)
+    ks.addHS("shared", "shared-secret-0123456789")
+    sharedSize: int = ks.size()
+    ks.remove("shared")
+    print(f"shared kid: size={sharedSize} after-remove={ks.size()}")
+    ks.addHS("only", "only-secret-0123456789")
+    ks.remove("never-added")
+    print(f"unknown remove: {ks.size()}")
+    print(f"hs set accepts hs512: {ks.verifyHS256(Jwt.signHS512({'sub': 'a'}, 'only-secret-0123456789', 60))}")
+    print(f"empty secret refused: {kind(Jwt.signHS256({'sub': 'a'}, '', 60))} kid-sign-empty={Jwt.signHS256Kid({'sub': 'a'}, 'k', '', 60) == ''} hs512-empty={Jwt.signHS512({'sub': 'a'}, '', 60) == ''}")
+    forged256: str = ""
+    forged512: str = ""
+    go! {
+        forged256 = ksForgeEmptyKey(jwt.SigningMethodHS256)
+        forged512 = ksForgeEmptyKey(jwt.SigningMethodHS512)
+    }
+    blank: JwtKeySet = JwtKeySet()
+    blank.addHS("blank", "")
+    print(f"forged with the empty key: direct={Jwt.verifyHS256(forged256, '')} decode={kind(Jwt.decodeHS256(forged256, ''))} hs512={Jwt.verifyHS512(forged512, '')} keyset={blank.verifyHS256(forged256)}")
+
+    # ── Rotation stress ─────────────────────────────────────────
+    authority: TokenAuthority = TokenAuthority()
+    batches: list[list[str]] = []
+    do {
+        for _ in range(4) {
+            batches.append(issueBatch(authority, 15)?)
+            _ = authority.rotate()
+        }
+    } catch err {
+        print(f"issue failed: {err}")
+    }
+    tokens: list[str] = [token for batch in batches for token in batch]
+
+    # Verify everything concurrently while the authority keeps rotating.
+    pending = [verifyTask(authority, token) for token in tokens]
+    for _ in range(3) {
+        _ = authority.rotate()
+    }
+    outcomes: list[Result[str]] = []
+    for task in pending {
+        outcomes.append(await task)
+    }
+    print(f"concurrent verifications: {len([o for o in outcomes if o.ok()])}/{len(tokens)}")
+
+    esKeys: JwtKeySet = JwtKeySet()
+    _ = esKeys.addEC("es-1", ecPub)
+    _ = esKeys.addRSA("rsa-1", rsaPub)
+    esTokens: list[str] = [Jwt.signES256({"sub": f"device-{i}"}, ecPriv, 120, "es-1").unwrap() for i in range(20)]
+    decodes = [decodeTask(esKeys, token) for token in esTokens]
+    subjects: set[str] = set()
+    decoded: int = 0
+    for task in decodes {
+        r: Result[str] = await task
+        if r.ok() {
+            decoded += 1
+            subjects.add(r.unwrap())
+        }
+    }
+    print(f"concurrent es256 decodes: {decoded}/20 subjects={len(subjects)}")
+
+    # Drop the oldest kid: only its 15 tokens are refused now.
+    authority.keys.remove("k0")
+    for kid in ["k4", "k5", "k6", "k7"] {
+        authority.keys.remove(kid)
+    }
+    after: list[Result[str]] = [authority.subject(token) for token in tokens]
+    refused: list[str] = [Jwt.extractKid(tokens[i]) for i in range(len(tokens)) if not after[i].ok()]
+    print(f"after removing k0: valid={len([r for r in after if r.ok()])} refused={len(refused)} refused-kid={','.join(sorted(set(refused)))}")
+    do {
+        _ = authority.subject(tokens[0])?
+        print("do/catch reports: nothing")
+    } catch err {
+        print(f"do/catch reports: {err.kind} for {Jwt.extractKid(tokens[0])}")
+    }
+    remaining: list[str] = authority.keys.kids()
+    joined: str = ""
+    go! {
+        joined = ksSorted(remaining)
+    }
+    print(f"kids: {joined}")
+    print("ok")
+}
